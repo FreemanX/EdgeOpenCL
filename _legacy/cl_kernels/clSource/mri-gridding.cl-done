@@ -1,0 +1,457 @@
+#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable 
+
+typedef struct{
+  float real;
+  float imag;
+  float kX;
+  float kY;
+  float kZ;
+  float sdc;
+} ReconstructionSample;
+
+#define TILE 64
+#define LOG_TILE 6
+
+__kernel void binning_kernel (unsigned int n, 
+  __global ReconstructionSample* sample_g, 
+  __global unsigned int* idxKey_g,
+  __global unsigned int* idxValue_g, 
+  __global unsigned int* binCount_g, 
+  unsigned int binsize, unsigned int gridNumElems){
+  unsigned int key;
+  unsigned int sampleIdx = get_global_id(0); 
+  ReconstructionSample pt;
+  unsigned int binIdx;
+  unsigned int count; 
+  if (sampleIdx < n){
+    pt = sample_g[sampleIdx]; 
+    binIdx = (unsigned int)(pt.kZ)*((int) ( SIZE_XY_VAL )) + (unsigned int)(pt.kY)*((int)( GRIDSIZE_VAL1 )) + (unsigned int)(pt.kX); 
+    count = atom_add(binCount_g+binIdx, 1);
+    if (count < binsize){
+      key = binIdx;
+    } else {
+      atom_sub(binCount_g+binIdx, 1);
+      key = gridNumElems;
+    } 
+    idxKey_g[sampleIdx] = key;
+    idxValue_g[sampleIdx] = sampleIdx;
+  }
+}
+
+__kernel void reorder_kernel(int n, 
+ __global unsigned int* idxValue_g, 
+ __global ReconstructionSample* samples_g, 
+ __global ReconstructionSample* sortedSample_g){
+  unsigned int index = get_global_id(0); 
+  unsigned int old_index;
+  ReconstructionSample pt; 
+  if (index < n){
+    old_index = idxValue_g[index];
+    pt = samples_g[old_index];
+    sortedSample_g[index] = pt;
+  }
+} 
+float kernel_value(float v){ 
+  float rValue = 0; 
+  float z = v*v; 
+  float num = (z* (z* (z* (z* (z* (z* (z* (z* (z* (z* (z* (z* (z*
+    (z* 0.210580722890567e-22f  + 0.380715242345326e-19f ) +
+    0.479440257548300e-16f) + 0.435125971262668e-13f ) +
+  0.300931127112960e-10f) + 0.160224679395361e-7f  ) +
+  0.654858370096785e-5f)  + 0.202591084143397e-2f  ) +
+  0.463076284721000e0f)   + 0.754337328948189e2f   ) +
+  0.830792541809429e4f)   + 0.571661130563785e6f   ) +
+  0.216415572361227e8f)   + 0.356644482244025e9f   ) +
+  0.144048298227235e10f);
+
+  float den = (z*(z*(z-0.307646912682801e4f)+0.347626332405882e7f)-0.144048298227235e10f); 
+  rValue = native_divide(-num,den); 
+  return rValue;
+}
+
+__kernel void gridding_GPU (__global ReconstructionSample* sample_g, 
+  __global unsigned int* binStartAddr_g, 
+  __global float2* gridData_g, 
+  __global float* sampleDensity_g, 
+  float beta
+  ){
+  __local ReconstructionSample sharedBin[TILE]; 
+  const int flatIdx = get_local_id(2)*get_local_size(1)*get_local_size(0) + get_local_id(1)*get_local_size(0) + get_local_id(0);
+  const int z0 = get_local_size(2)*(get_group_id(1)/(GRIDSIZE_VAL2/get_local_size(1)));
+  const int y0 = get_local_size(1)*(get_group_id(1)%(GRIDSIZE_VAL2/get_local_size(1)));
+  const int x0 = get_group_id(0)*get_local_size(0); 
+  const int X  = x0+get_local_id(0);
+  const int Y  = y0+get_local_id(1);
+  const int Z  = z0+get_local_id(2); 
+  const int xl = x0-CEIL_CUTOFF_VAL;
+  const int xL = (xl < 0) ? 0 : xl;
+  const int xh = x0+get_local_size(0)+CUTOFF_VAL;
+  const int xH = (xh >= GRIDSIZE_VAL1) ? GRIDSIZE_VAL1-1 : xh; 
+  const int yl = y0-CEIL_CUTOFF_VAL;
+  const int yL = (yl < 0) ? 0 : yl;
+  const int yh = y0+get_local_size(1)+CUTOFF_VAL;
+  const int yH = (yh >= GRIDSIZE_VAL2) ? GRIDSIZE_VAL2-1 : yh; 
+  const int zl = z0-CEIL_CUTOFF_VAL;
+  const int zL = (zl < 0) ? 0 : zl;
+  const int zh = z0+get_local_size(2)+CUTOFF_VAL;
+  const int zH = (zh >= GRIDSIZE_VAL3) ? GRIDSIZE_VAL3-1 : zh; 
+  const int idx = Z*SIZE_XY_VAL + Y*GRIDSIZE_VAL1 + X; 
+  float2 pt = (float2) (0.0f, 0.0f);
+  float density = 0.0f; 
+  for (int z = zL; z <= zH; z++){
+    for (int y = yL; y <= yH; y++){
+      __global const unsigned int *addr = binStartAddr_g+z*SIZE_XY_VAL+ y*GRIDSIZE_VAL1;
+      const unsigned int start = *(addr+xL);
+      const unsigned int end   = *(addr+xH+1);
+      const unsigned int delta = end-start;
+      for (int x = 0; x < ((delta+TILE-1)>>LOG_TILE); x++){
+        int tileSize = ((delta-(x<<LOG_TILE)) > TILE) ? TILE : (delta-(x<<LOG_TILE));
+        int globalIdx = flatIdx+(x<<LOG_TILE);
+        barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads();
+        if(flatIdx < tileSize){
+          sharedBin[flatIdx] = sample_g[start+globalIdx];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads(); 
+        for (int j=0; j< tileSize; j++){
+          const float real = sharedBin[j].real;
+          const float imag = sharedBin[j].imag;
+          const float sdc = sharedBin[j].sdc; 
+          if((real != 0.0f || imag != 0.0f) && sdc != 0.0f){
+            float v = (sharedBin[j].kX-X)*(sharedBin[j].kX-X);
+            v += (sharedBin[j].kY-Y)*(sharedBin[j].kY-Y);
+            v += (sharedBin[j].kZ-Z)*(sharedBin[j].kZ-Z);
+            if(v<CUTOFF2_VAL){
+             const float w = kernel_value(beta*sqrt(1.0f-(v*ONE_OVER_CUTOFF2_VAL))) *sdc;
+             pt.x += w*real;
+             pt.y += w*imag;
+             density += 1.0f; 
+           }
+         }
+       }                
+     }
+   }
+ } 
+ gridData_g[idx] = pt;
+ sampleDensity_g[idx] = density;
+}
+
+#pragma OPENCL EXTENSION cl_khr_local_int32_base_atomics : enable
+
+#define UINT32_MAX 4294967295
+#define BITS 4
+#define LNB 4
+
+#define SORT_BS 256
+
+//#define CONFLICT_FREE_OFFSET(index) ((index) >> LNB + (index) >> (2*LNB))
+#define CONFLICT_FREE_OFFSET(index) (((unsigned int)(index) >> min((unsigned int)((LNB)+(index)), (unsigned int)((32-(2*LNB)))))>>(2*LNB))
+#define BLOCK_P_OFFSET (4*SORT_BS+1+(4*SORT_BS+1)/16+(4*SORT_BS+1)/64)
+
+void scan (__local unsigned int s_data[BLOCK_P_OFFSET]){
+  unsigned int thid = get_local_id(0);
+  barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads();
+  s_data[2*thid+1+CONFLICT_FREE_OFFSET(2*thid+1)] += s_data[2*thid+CONFLICT_FREE_OFFSET(2*thid)];
+  s_data[2*(get_local_size(0)+thid)+1+CONFLICT_FREE_OFFSET(2*(get_local_size(0)+thid)+1)] += s_data[2*(get_local_size(0)+thid)+CONFLICT_FREE_OFFSET(2*(get_local_size(0)+thid))];
+  unsigned int stride = 2;
+  for (unsigned int d = get_local_size(0); d > 0; d >>= 1)
+  {
+    barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads();
+    if (thid < d)
+    {
+      unsigned int i  = 2*stride*thid;
+      unsigned int ai = i + stride - 1;
+      unsigned int bi = ai + stride;
+
+      ai += CONFLICT_FREE_OFFSET(ai);
+      bi += CONFLICT_FREE_OFFSET(bi);
+
+      s_data[bi] += s_data[ai];
+    }
+    stride *= 2;
+  }
+  if (thid == 0){
+    unsigned int last = 4*get_local_size(0)-1;
+    last += CONFLICT_FREE_OFFSET(last);
+    s_data[4*get_local_size(0)+CONFLICT_FREE_OFFSET(4*get_local_size(0))] = s_data[last];
+    s_data[last] = 0;
+  }
+
+  for (unsigned int d = 1; d <= get_local_size(0); d *= 2)
+  {
+    stride >>= 1;
+    barrier(CLK_LOCAL_MEM_FENCE ); 
+    if (thid < d)
+    {
+      unsigned int i  = 2*stride*thid;
+      unsigned int ai = i + stride - 1;
+      unsigned int bi = ai + stride;
+      ai += CONFLICT_FREE_OFFSET(ai);
+      bi += CONFLICT_FREE_OFFSET(bi);
+      unsigned int t  = s_data[ai];
+      s_data[ai] = s_data[bi];
+      s_data[bi] += t;
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE ); 
+  unsigned int temp = s_data[2*thid+CONFLICT_FREE_OFFSET(2*thid)];
+  s_data[2*thid+CONFLICT_FREE_OFFSET(2*thid)] = s_data[2*thid+1+CONFLICT_FREE_OFFSET(2*thid+1)];
+  s_data[2*thid+1+CONFLICT_FREE_OFFSET(2*thid+1)] += temp;
+  unsigned int temp2 = s_data[2*(get_local_size(0)+thid)+CONFLICT_FREE_OFFSET(2*(get_local_size(0)+thid))];
+  s_data[2*(get_local_size(0)+thid)+CONFLICT_FREE_OFFSET(2*(get_local_size(0)+thid))] = s_data[2*(get_local_size(0)+thid)+1+CONFLICT_FREE_OFFSET(2*(get_local_size(0)+thid)+1)];
+  s_data[2*(get_local_size(0)+thid)+1+CONFLICT_FREE_OFFSET(2*(get_local_size(0)+thid)+1)] += temp2;
+  barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads();
+}
+
+__kernel void splitSort(int numElems, int iter,
+ __global unsigned int* keys,
+ __global unsigned int* values,
+ __global unsigned int* histo){
+  __local unsigned int flags[BLOCK_P_OFFSET];
+  __local unsigned int histo_s[1<<BITS];
+  const unsigned int tid = get_local_id(0);
+  const unsigned int gid = get_group_id(0)*4*SORT_BS+4*get_local_id(0);
+  uint4 lkey = { UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+  uint4 lvalue;
+  if (gid < numElems){
+    lkey = *((__global uint4*)(keys+gid));
+    lvalue = *((__global uint4*)(values+gid));
+  }
+  if(tid < (1<<BITS)){
+    histo_s[tid] = 0;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE );
+  atom_add(histo_s+((lkey.x&((1<<(BITS*(iter+1)))-1))>>(BITS*iter)),1);
+  atom_add(histo_s+((lkey.y&((1<<(BITS*(iter+1)))-1))>>(BITS*iter)),1);
+  atom_add(histo_s+((lkey.z&((1<<(BITS*(iter+1)))-1))>>(BITS*iter)),1);
+  atom_add(histo_s+((lkey.w&((1<<(BITS*(iter+1)))-1))>>(BITS*iter)),1);
+  uint4 index = (uint4) (4*tid, 4*tid+1, 4*tid+2, 4*tid+3);
+  for (int i=BITS*iter; i<BITS*(iter+1);i++){
+    const uint4 flag = (uint4) ( (lkey.x>>i)&0x1,(lkey.y>>i)&0x1,(lkey.z>>i)&0x1,(lkey.w>>i)&0x1 );
+    flags[index.x+CONFLICT_FREE_OFFSET(index.x)] = 1<<(16*flag.x);
+    flags[index.y+CONFLICT_FREE_OFFSET(index.y)] = 1<<(16*flag.y);
+    flags[index.z+CONFLICT_FREE_OFFSET(index.z)] = 1<<(16*flag.z);
+    flags[index.w+CONFLICT_FREE_OFFSET(index.w)] = 1<<(16*flag.w);
+    scan (flags);
+    index.x = (flags[index.x+CONFLICT_FREE_OFFSET(index.x)]>>(16*flag.x))&0xFFFF;
+    index.y = (flags[index.y+CONFLICT_FREE_OFFSET(index.y)]>>(16*flag.y))&0xFFFF;
+    index.z = (flags[index.z+CONFLICT_FREE_OFFSET(index.z)]>>(16*flag.z))&0xFFFF;
+    index.w = (flags[index.w+CONFLICT_FREE_OFFSET(index.w)]>>(16*flag.w))&0xFFFF;
+    unsigned short offset = flags[4*get_local_size(0)+CONFLICT_FREE_OFFSET(4*get_local_size(0))]&0xFFFF;
+    index.x += (flag.x) ? offset : 0;
+    index.y += (flag.y) ? offset : 0;
+    index.z += (flag.z) ? offset : 0;
+    index.w += (flag.w) ? offset : 0;
+    barrier(CLK_LOCAL_MEM_FENCE ); 
+  }
+  if (gid < numElems){
+    keys[get_group_id(0)*4*SORT_BS+index.x] = lkey.x;
+    keys[get_group_id(0)*4*SORT_BS+index.y] = lkey.y;
+    keys[get_group_id(0)*4*SORT_BS+index.z] = lkey.z;
+    keys[get_group_id(0)*4*SORT_BS+index.w] = lkey.w;
+    values[get_group_id(0)*4*SORT_BS+index.x] = lvalue.x;
+    values[get_group_id(0)*4*SORT_BS+index.y] = lvalue.y;
+    values[get_group_id(0)*4*SORT_BS+index.z] = lvalue.z;
+    values[get_group_id(0)*4*SORT_BS+index.w] = lvalue.w;
+  }
+  if (tid < (1<<BITS)){
+    histo[get_num_groups(0)*get_local_id(0)+get_group_id(0)] = histo_s[tid];
+  }
+}
+
+__kernel void splitRearrange (int numElems, int iter,
+  __global unsigned int* keys_i,
+  __global unsigned int* keys_o,
+  __global unsigned int* values_i,
+  __global unsigned int* values_o,
+  __global unsigned int* histo){
+  __local unsigned int histo_s[(1<<BITS)];
+  __local uint array_s[4*SORT_BS];
+  int index = get_group_id(0)*4*SORT_BS + 4*get_local_id(0);
+  if (get_local_id(0) < (1<<BITS)){
+    histo_s[get_local_id(0)] = histo[get_num_groups(0)*get_local_id(0)+get_group_id(0)];
+  }
+  uint4 mine, value;
+  if (index < numElems){
+    mine = *((__global uint4*)(keys_i+index));
+    value = *((__global uint4*)(values_i+index));
+  } else {
+    mine.x = UINT32_MAX;
+    mine.y = UINT32_MAX;
+    mine.z = UINT32_MAX;
+    mine.w = UINT32_MAX;
+  }
+  uint4 masks = (uint4) ( (mine.x&((1<<(BITS*(iter+1)))-1))>>(BITS*iter),
+   (mine.y&((1<<(BITS*(iter+1)))-1))>>(BITS*iter),
+   (mine.z&((1<<(BITS*(iter+1)))-1))>>(BITS*iter),
+   (mine.w&((1<<(BITS*(iter+1)))-1))>>(BITS*iter) );
+  vstore4(masks, get_local_id(0), (__local uint *)array_s);
+  barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads();
+  uint4 new_index = (uint4) ( histo_s[masks.x],histo_s[masks.y],histo_s[masks.z],histo_s[masks.w] );
+  int i = 4*get_local_id(0)-1;
+  while (i >= 0){
+    if (array_s[i] == masks.x){
+      new_index.x++;
+      i--;
+    } else {
+      break;
+    }
+  }
+  new_index.y = (masks.y == masks.x) ? new_index.x+1 : new_index.y;
+  new_index.z = (masks.z == masks.y) ? new_index.y+1 : new_index.z;
+  new_index.w = (masks.w == masks.z) ? new_index.z+1 : new_index.w;
+  if (index < numElems){
+    keys_o[new_index.x] = mine.x;
+    values_o[new_index.x] = value.x;
+
+    keys_o[new_index.y] = mine.y;
+    values_o[new_index.y] = value.y;
+
+    keys_o[new_index.z] = mine.z;
+    values_o[new_index.z] = value.z;
+
+    keys_o[new_index.w] = mine.w;
+    values_o[new_index.w] = value.w;
+  }
+}
+
+#define BLOCK_SIZE 1024
+#define GRID_SIZE 65535
+#define NUM_BANKS 16
+#define LOG_NUM_BANKS 4
+#define LNB LOG_NUM_BANKS
+#define EXPANDED_SIZE(__x) (__x+(__x>>LOG_NUM_BANKS)+(__x>>(2*LOG_NUM_BANKS)))
+__kernel void scan_L1_kernel(unsigned int n, __global unsigned int* dataBase, unsigned int data_offset, __global unsigned int* interBase, unsigned int inter_offset)
+{
+  __local unsigned int s_data[EXPANDED_SIZE(BLOCK_SIZE)]; 
+  __global unsigned int *data = dataBase + data_offset;
+  __global unsigned int *inter = interBase + inter_offset;
+  unsigned int thid = get_local_id(0);
+  unsigned int g_ai = get_group_id(0)*2*get_local_size(0) + get_local_id(0);
+  unsigned int g_bi = g_ai + get_local_size(0);
+  unsigned int s_ai = thid;
+  unsigned int s_bi = thid + get_local_size(0);
+  s_ai += CONFLICT_FREE_OFFSET(s_ai);
+  s_bi += CONFLICT_FREE_OFFSET(s_bi);
+  s_data[s_ai] = (g_ai < n) ? data[g_ai] : 0;
+  s_data[s_bi] = (g_bi < n) ? data[g_bi] : 0;
+  unsigned int stride = 1;
+  for (unsigned int d = get_local_size(0); d > 0; d >>= 1) {
+      barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads();
+      if (thid < d) {
+        unsigned int i  = 2*stride*thid;
+        unsigned int ai = i + stride - 1;
+        unsigned int bi = ai + stride;
+        ai += CONFLICT_FREE_OFFSET(ai);
+        bi += CONFLICT_FREE_OFFSET(bi);
+        s_data[bi] += s_data[ai];
+      }
+      stride *= 2;
+    }
+    if (thid == 0) {
+      unsigned int last = get_local_size(0)*2 -1;
+      last += CONFLICT_FREE_OFFSET(last);
+      inter[get_group_id(0)] = s_data[last];
+      s_data[last] = 0;
+    }
+    for (unsigned int d = 1; d <= get_local_size(0); d *= 2) {
+      stride >>= 1;
+      barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads();
+      if (thid < d) {
+        unsigned int i  = 2*stride*thid;
+        unsigned int ai = i + stride - 1;
+        unsigned int bi = ai + stride;
+
+        ai += CONFLICT_FREE_OFFSET(ai);
+        bi += CONFLICT_FREE_OFFSET(bi);
+
+        unsigned int t  = s_data[ai];
+        s_data[ai] = s_data[bi];
+        s_data[bi] += t;
+      }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads();
+    if (g_ai < n) { data[g_ai] = s_data[s_ai]; }
+    if (g_bi < n) { data[g_bi] = s_data[s_bi]; }
+  }
+
+  __kernel void scan_inter1_kernel(__global unsigned int* data, unsigned int iter)
+  {
+    __local unsigned int s_data[DYN_LOCAL_MEM_SIZE];
+    unsigned int thid = get_local_id(0);
+    unsigned int gthid = get_global_id(0);
+    unsigned int gi = 2*iter*gthid;
+    unsigned int g_ai = gi + iter - 1;
+    unsigned int g_bi = g_ai + iter;
+    unsigned int s_ai = 2*thid;
+    unsigned int s_bi = 2*thid + 1;
+    s_ai += CONFLICT_FREE_OFFSET(s_ai);
+    s_bi += CONFLICT_FREE_OFFSET(s_bi);
+    s_data[s_ai] = data[g_ai];
+    s_data[s_bi] = data[g_bi];
+    unsigned int stride = 1;
+    for (unsigned int d = get_local_size(0); d > 0; d >>= 1) {
+      barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads();
+      if (thid < d) {
+        unsigned int i  = 2*stride*thid;
+        unsigned int ai = i + stride - 1;
+        unsigned int bi = ai + stride;
+
+        ai += CONFLICT_FREE_OFFSET(ai);
+        bi += CONFLICT_FREE_OFFSET(bi);
+        s_data[bi] += s_data[ai];
+      }
+      stride *= 2;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads();
+    data[g_ai] = s_data[s_ai];
+    data[g_bi] = s_data[s_bi];
+  }
+
+  __kernel void scan_inter2_kernel(__global unsigned int* data, unsigned int iter)
+  {
+    __local unsigned int s_data[DYN_LOCAL_MEM_SIZE];
+
+    unsigned int thid = get_local_id(0);
+    unsigned int gthid = get_global_id(0);
+    unsigned int gi = 2*iter*gthid;
+    unsigned int g_ai = gi + iter - 1;
+    unsigned int g_bi = g_ai + iter;
+    unsigned int s_ai = 2*thid;
+    unsigned int s_bi = 2*thid + 1;
+    s_ai += CONFLICT_FREE_OFFSET(s_ai);
+    s_bi += CONFLICT_FREE_OFFSET(s_bi);
+    s_data[s_ai] = data[g_ai];
+    s_data[s_bi] = data[g_bi];
+    unsigned int stride = get_local_size(0)*2;
+    for (unsigned int d = 1; d <= get_local_size(0); d *= 2) {
+      stride >>= 1;
+      barrier(CLK_LOCAL_MEM_FENCE ); 
+      if (thid < d) {
+        unsigned int i  = 2*stride*thid;
+        unsigned int ai = i + stride - 1;
+        unsigned int bi = ai + stride;
+        ai += CONFLICT_FREE_OFFSET(ai);
+        bi += CONFLICT_FREE_OFFSET(bi);
+        unsigned int t  = s_data[ai];
+        s_data[ai] = s_data[bi];
+        s_data[bi] += t;
+      }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE ); 
+    data[g_ai] = s_data[s_ai];
+    data[g_bi] = s_data[s_bi];
+  }
+
+__kernel void uniformAdd(unsigned int n, __global unsigned int *dataBase, unsigned int data_offset, __global unsigned int *interBase, unsigned int inter_offset){
+    __local unsigned int uni;
+    __global unsigned int *data = dataBase + data_offset;
+    __global unsigned int *inter = interBase + inter_offset;
+    if (get_local_id(0) == 0) { uni = inter[get_group_id(0)]; }
+    barrier(CLK_LOCAL_MEM_FENCE ); //__syncthreads();
+    unsigned int g_ai = get_group_id(0)*2*get_local_size(0) + get_local_id(0);
+    unsigned int g_bi = g_ai + get_local_size(0);
+    if (g_ai < n) { data[g_ai] += uni; }
+    if (g_bi < n) { data[g_bi] += uni; }
+}
+
+
