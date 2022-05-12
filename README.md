@@ -109,5 +109,5 @@ News, vol. 41, no. 1, pp. 407–418, 2013.
 [4. PolyBench/GPU](http://web.cse.ohio-state.edu/~pouchet.2/software/polybench/GPU/index.html)   
 [5. Parboil Benchmarks](http://impact.crhc.illinois.edu/parboil/parboil.aspx)   
 [6. zuzuf/freeocl](https://github.com/zuzuf/freeocl)   
-
+[7. krrishnarraj/libopencl-stub](https://github.com/krrishnarraj/libopencl-stub)   
 > Disclaimer: _This library was developed based on a research project I was doing in HKU till early 2021. It's no longer maintained or updated since then. The original code was developed as a proof of concept and has been tested on Snapdragon 845, 855 and 655 only._ 
